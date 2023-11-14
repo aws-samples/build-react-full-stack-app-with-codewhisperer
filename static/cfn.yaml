@@ -1,0 +1,406 @@
+
+
+
+Mappings:
+  Subnets:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicOne:
+      CIDR: '10.0.0.0/24'
+    PublicTwo:
+      CIDR: '10.0.1.0/24'
+    PrivateOne:
+      CIDR: '10.0.2.0/24'
+    PrivateTwo:
+      CIDR: '10.0.3.0/24'
+
+
+Resources:
+
+  DevBoxDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Tags:
+        - Key: Kind
+          Value: devbox
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: "2.2"
+        description: Install packages on Ubuntu
+        parameters:
+          arch:
+            type: String
+            default: amd64
+            description: Instance architecture type
+            allowedValues:
+              - arm64
+              - amd64
+          release:
+            type: String
+            default: jammy
+            allowedValues:
+              - focal
+              - bionic
+              - jammy
+          nodeVersion:
+            type: String
+            default: node_18.x
+        mainSteps:
+          - action: aws:runShellScript
+            name: InstallBasePackages
+            inputs:
+              runCommand:
+                - apt update
+                - DEBIAN_FRONTEND=noninteractive apt install -y software-properties-common build-essential curl unzip
+          - action: aws:runShellScript
+            name: InstallAWSCLIArm
+            precondition:
+              StringEquals:
+                - "{{ arch }}"
+                - arm64
+            inputs:
+              runCommand:
+                - curl -L -o /tmp/aws-cli.zip https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip
+                - unzip -d /tmp /tmp/aws-cli.zip
+                - /tmp/aws/install
+                - rm -rf /tmp/aws
+                - echo "complete -C '/usr/local/bin/aws_completer' aws" >> /home/ubuntu/.bashrc
+          - action: aws:runShellScript
+            name: InstallAWSCLIIntel
+            precondition:
+              StringEquals:
+                - "{{ arch }}"
+                - amd64
+            inputs:
+              runCommand:
+                - curl -L -o /tmp/aws-cli.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+                - unzip -d /tmp /tmp/aws-cli.zip
+                - /tmp/aws/install
+                - rm -rf /tmp/aws
+                - echo "complete -C '/usr/local/bin/aws_completer' aws" >> /home/ubuntu/.bashrc
+          - action: aws:runShellScript
+            name: InstallNode
+            inputs:
+              runCommand:
+                - curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource-keyring.gpg
+                - echo "deb [arch={{ arch }} signed-by=/usr/share/keyrings/nodesource-keyring.gpg] https://deb.nodesource.com/{{ nodeVersion }}  {{ release }} main" >> /etc/apt/sources.list.d/nodesource.list
+                - apt update
+                - DEBIAN_FRONTEND=noninteractive apt install -y nodejs
+          - action: aws:runShellScript
+            name: BuildMongoDB
+            inputs:
+              runCommand:
+                - sudo apt-get install gnupg curl
+                - curl -fsSL https://pgp.mongodb.com/server-7.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+                - echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+                - sudo apt-get update
+                - sudo apt-get install -y mongodb-org
+                - sudo systemctl start mongod
+          - action: aws:runShellScript
+            name: ConfigureCodeServer
+            inputs:
+              runCommand:
+                - export HOME=/home/ubuntu
+                - mkdir /home/ubuntu/MERN_Stack
+                - touch /home/ubuntu/MERN_Stack/environment.sh
+                - chmod +rwx /home/ubuntu/MERN_Stack
+                - chmod +rwx /home/ubuntu/MERN_Stack/environment.sh
+                - sudo chown ubuntu /home/ubuntu/MERN_Stack -R 
+                - curl -fsSL https://code-server.dev/install.sh | sh
+                - sudo systemctl enable --now code-server@ubuntu
+                - sudo apt install -y nginx
+                - |
+                  sudo tee /etc/nginx/sites-available/code-server <<EOF
+                  server {
+                      listen 80;
+                      listen [::]:80;
+                      server_name $(curl -s http://169.254.169.254/latest/meta-data/public-hostname);
+
+                      location / {
+                        proxy_pass http://localhost:8080/;
+                        proxy_set_header Host \$host;
+                        proxy_set_header Upgrade \$http_upgrade;
+                        proxy_set_header Connection upgrade;
+                        proxy_set_header Accept-Encoding gzip;
+                      }
+                  }
+                  EOF
+                - |
+                  sudo tee /home/ubuntu/.config/code-server/config.yaml <<EOF
+                  cert: false
+                  auth: password
+                  hashed-password: "$(echo -n $(aws sts get-caller-identity --query "Account" --output text) | sudo npx argon2-cli -e)"
+                  EOF
+                - sudo -u ubuntu --login mkdir -p /home/ubuntu/.local/share/code-server/User/
+                - sudo -u ubuntu --login touch /home/ubuntu/.local/share/code-server/User/settings.json
+                - |
+                  sudo tee /home/ubuntu/.local/share/code-server/User/settings.json <<EOF
+                  {
+                    "extensions.autoUpdate": false,
+                    "extensions.autoCheckUpdates": false
+                  }
+                  EOF
+                - sudo systemctl restart code-server@ubuntu
+                - sudo ln -s ../sites-available/code-server /etc/nginx/sites-enabled/code-server
+                - sudo systemctl restart nginx
+                - sudo wget https://open-vsx.org/api/amazonwebservices/aws-toolkit-vscode/1.74.0/file/amazonwebservices.aws-toolkit-vscode-1.74.0.vsix -O /tmp/mazonwebservices.aws-toolkit-vscode-1.74.0.vsix
+                - sudo -u ubuntu --login code-server --install-extension /tmp/mazonwebservices.aws-toolkit-vscode-1.74.0.vsix --force
+
+
+                
+
+
+  DevBoxAssoc:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref DevBoxDoc
+      DocumentVersion: $LATEST
+      MaxConcurrency: 100
+      MaxErrors: 100
+      Targets:
+        - Key: tag:Name
+          Values:
+            - devbox
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Subnets, VPC, CIDR]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicOneSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !FindInMap [Subnets, PublicOne, CIDR]
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+
+  PublicOneRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicOneRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicOneRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicOneRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicOneRouteTable
+      SubnetId: !Ref PublicOneSubnet
+
+  PublicTwoSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !FindInMap [Subnets, PublicTwo, CIDR]
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+
+  PublicTwoRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicTwoRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicTwoRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicTwoRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicTwoRouteTable
+      SubnetId: !Ref PublicTwoSubnet
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !FindInMap [Subnets, PrivateOne, CIDR]
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+  
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !FindInMap [Subnets, PrivateTwo, CIDR]
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      SubnetId: !Ref PublicOneSubnet
+      AllocationId: !GetAtt NatPublicIP.AllocationId
+
+  NatPublicIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPC
+    Properties:
+      Domain: vpc
+  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+  
+  PrivateSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTable
+  
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTable      
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+
+  Profile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref Role
+
+  DevBox:
+      Type: AWS::EC2::Instance
+      DependsOn: DevBoxAssoc
+      Properties:
+        
+        
+        BlockDeviceMappings:
+          - Ebs:
+              VolumeSize: 100
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+            DeviceName: /dev/sda1
+        Monitoring: true
+        SubnetId: !Ref PublicOneSubnet
+        ImageId: >-
+          {{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}
+        InstanceType: c6i.xlarge
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        IamInstanceProfile: !Ref Profile
+        UserData:
+          Fn::Base64: |
+            #cloud-config
+            hostname: dev
+            runcmd:
+              - mkdir -p /workspaces && chown ubuntu:ubuntu /workspaces
+        Tags:
+        - Key: Name
+          Value: devbox
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: devbox
+      SecurityGroupIngress:
+        - FromPort: 2376
+          ToPort: 2376
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+        - FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+        - FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+        - FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+        - FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+        - FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+      VpcId: !Ref VPC
+
+
+
+Outputs:
+  Password:
+    Description: Password for VSCode-Server
+    Value: !Ref "AWS::AccountId"
+  PublicIp:
+    Description: Server Public IP
+    Value: !GetAtt DevBox.PublicIp
+    Export: 
+      Name: !Sub "${AWS::StackName}-PublicIp"
+  VSCodeWebUrl:
+    Description: URL for the VS Code Web
+    Value: !Sub "http://${DevBox.PublicDnsName}/?folder=/home/ubuntu/MERN_Stack"
+    Export: 
+      Name: !Sub "${AWS::StackName}-VSCodeWebUrl"
+
